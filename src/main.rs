@@ -134,6 +134,7 @@ fn main() {
   framebuffer.set_background_color(Color::new(50, 50, 100, 255));
 
   let maze = load_maze("maze.txt");
+
   let mut player = Player {
     pos: Vector2::new(150.0, 150.0),
     a: PI / 3.0,
