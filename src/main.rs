@@ -1,172 +1,297 @@
-// main.rs
-#![allow(unused_imports)]
-#![allow(dead_code)]
-
-mod line;
-mod framebuffer;
-mod maze;
-mod caster;
-mod player;
-
-use line::line;
-use maze::{Maze,load_maze};
-use caster::{cast_ray, Intersect};
-use framebuffer::Framebuffer;
-use player::{Player, process_events};
-
 use raylib::prelude::*;
-use std::thread;
-use std::time::Duration;
 use std::f32::consts::PI;
 
-fn cell_to_color(cell: char) -> Color {
-  match cell {
-    '+' => {
-      return Color::BLUEVIOLET;
-    },
-    '-' => {
-      return Color::VIOLET;
-    },
-    '|' => {
-      return Color::VIOLET;
-    },
-    'g' => {
-      return Color::GREEN;
-    },
-    _ => {
-      return Color::WHITE;
-    },
-  }
+mod framebuffer;
+mod ray_intersect;
+mod sphere;
+mod camera;
+mod light;
+mod material;
+
+use framebuffer::Framebuffer;
+use ray_intersect::{Intersect, RayIntersect};
+use sphere::Sphere;
+use camera::Camera;
+use light::Light;
+use material::{Material, vector3_to_color};
+
+const ORIGIN_BIAS: f32 = 1e-4;
+
+fn procedural_sky(dir: Vector3) -> Vector3 {
+    let d = dir.normalized();
+    let t = (d.y + 1.0) * 0.5; // map y [-1,1] → [0,1]
+
+    let green = Vector3::new(0.1, 0.6, 0.2); // grass green
+    let white = Vector3::new(1.0, 1.0, 1.0); // horizon haze
+    let blue = Vector3::new(0.3, 0.5, 1.0);  // sky blue
+
+    if t < 0.54 {
+        // Bottom → fade green to white
+        let k = t / 0.55;
+        green * (1.0 - k) + white * k
+    } else if t < 0.55 {
+        // Around horizon → mostly white
+        white
+    } else if t < 0.8 {
+        // Fade white to blue
+        let k = (t - 0.55) / (0.25);
+        white * (1.0 - k) + blue * k
+    } else {
+        // Upper sky → solid blue
+        blue
+    }
 }
 
-fn draw_cell(
-  framebuffer: &mut Framebuffer,
-  xo: usize,
-  yo: usize,
-  block_size: usize,
-  cell: char,
-) {
-  if cell == ' ' {
-    return;
-  }
-  let color = cell_to_color(cell);
-  framebuffer.set_current_color(color);
-
-  for x in xo..xo + block_size {
-    for y in yo..yo + block_size {
-      framebuffer.set_pixel(x as u32, y as u32);
+fn offset_origin(intersect: &Intersect, direction: &Vector3) -> Vector3 {
+    let offset = intersect.normal * ORIGIN_BIAS;
+    if direction.dot(intersect.normal) < 0.0 {
+        intersect.point - offset
+    } else {
+        intersect.point + offset
     }
-  }
 }
 
-pub fn render_maze(
-  framebuffer: &mut Framebuffer,
-  maze: &Maze,
-  block_size: usize,
-  player: &Player,
-) {
-  for (row_index, row) in maze.iter().enumerate() {
-    for (col_index, &cell) in row.iter().enumerate() {
-      let xo = col_index * block_size;
-      let yo = row_index * block_size;
-      draw_cell(framebuffer, xo, yo, block_size, cell);
-    }
-  }
-
-  framebuffer.set_current_color(Color::WHITESMOKE);
-
-  // draw what the player sees
-  let num_rays = 5;
-  for i in 0..num_rays {
-    let current_ray = i as f32 / num_rays as f32; // current ray divided by total rays
-    let a = player.a - (player.fov / 2.0) + (player.fov * current_ray);
-    cast_ray(framebuffer, &maze, &player, a, block_size, true);
-  }
+fn reflect(incident: &Vector3, normal: &Vector3) -> Vector3 {
+    *incident - *normal * 2.0 * incident.dot(*normal)
 }
 
-fn render_world(
-  framebuffer: &mut Framebuffer,
-  maze: &Maze,
-  block_size: usize,
-  player: &Player,
-) {
-  let num_rays = framebuffer.width;
+fn refract(incident: &Vector3, normal: &Vector3, refractive_index: f32) -> Option<Vector3> {
+    // Implementation of Snell's Law for refraction.
+    // It calculates the direction of a ray as it passes from one medium to another.
 
-  // let hw = framebuffer.width as f32 / 2.0;   // precalculated half width
-  let hh = framebuffer.height as f32 / 2.0;  // precalculated half height
+    // `cosi` is the cosine of the angle between the incident ray and the normal.
+    // We clamp it to the [-1, 1] range to avoid floating point errors.
+    let mut cosi = incident.dot(*normal).max(-1.0).min(1.0);
 
-  framebuffer.set_current_color(Color::WHITESMOKE);
+    // `etai` is the refractive index of the medium the ray is currently in.
+    // `etat` is the refractive index of the medium the ray is entering.
+    // `n` is the normal vector, which may be flipped depending on the ray's direction.
+    let mut etai = 1.0; // Assume we are in Air (or vacuum) initially
+    let mut etat = refractive_index;
+    let mut n = *normal;
 
-  for i in 0..num_rays {
-    let current_ray = i as f32 / num_rays as f32; // current ray divided by total rays
-    let a = player.a - (player.fov / 2.0) + (player.fov * current_ray);
-    let intersect = cast_ray(framebuffer, &maze, &player, a, block_size, false);
-
-    // Calculate the height of the stake
-    let distance_to_wall = intersect.distance;// how far is this wall from the player
-    let distance_to_projection_plane = 70.0; // how far is the "player" from the "camera"
-    // this ratio doesn't really matter as long as it is a function of distance
-    let stake_height = (hh / distance_to_wall) * distance_to_projection_plane;
-
-    // Calculate the position to draw the stake
-    let stake_top = (hh - (stake_height / 2.0)) as usize;
-    let stake_bottom = (hh + (stake_height / 2.0)) as usize;
-
-    // Draw the stake directly in the framebuffer
-    for y in stake_top..stake_bottom {
-      framebuffer.set_pixel(i, y as u32); // Assuming white color for the stake
+    if cosi > 0.0 {
+        // The ray is inside the medium (e.g., glass) and going out into the air.
+        // We need to swap the refractive indices.
+        std::mem::swap(&mut etai, &mut etat);
+        // We also flip the normal so it points away from the medium.
+        n = -n;
+    } else {
+        // The ray is outside the medium and going in.
+        // We need a positive cosine for the calculation, so we negate it.
+        cosi = -cosi;
     }
-  }
+
+    // `eta` is the ratio of the refractive indices (n1 / n2).
+    let eta = etai / etat;
+    // `k` is a term derived from Snell's law that helps determine if total internal reflection occurs.
+    let k = 1.0 - eta * eta * (1.0 - cosi * cosi);
+
+    if k < 0.0 {
+        // If k is negative, it means total internal reflection has occurred.
+        // There is no refracted ray, so we return None.
+        None
+    } else {
+        // If k is non-negative, we can calculate the direction of the refracted ray.
+        Some(*incident * eta + n * (eta * cosi - k.sqrt()))
+    }
+}
+
+fn cast_shadow(
+    intersect: &Intersect,
+    light: &Light,
+    objects: &[Sphere],
+) -> f32 {
+    let light_dir = (light.position - intersect.point).normalized();
+    let light_distance = (light.position - intersect.point).length();
+
+    let shadow_ray_origin = offset_origin(intersect, &light_dir);
+
+    for object in objects {
+        let shadow_intersect = object.ray_intersect(&shadow_ray_origin, &light_dir);
+        if shadow_intersect.is_intersecting && shadow_intersect.distance < light_distance {
+            return 1.0; // Hit something, full shadow
+        }
+    }
+
+    0.0 // No shadow
+}
+
+pub fn cast_ray(
+    ray_origin: &Vector3,
+    ray_direction: &Vector3,
+    objects: &[Sphere],
+    light: &Light,
+    depth: u32,
+) -> Vector3 {
+    if depth > 3 {
+        return procedural_sky(*ray_direction);
+        // return SKYBOX_COLOR;
+    }
+
+    let mut intersect = Intersect::empty();
+    let mut zbuffer = f32::INFINITY;
+
+    for object in objects {
+        let i = object.ray_intersect(ray_origin, ray_direction);
+        if i.is_intersecting && i.distance < zbuffer {
+            zbuffer = i.distance;
+            intersect = i;
+        }
+    }
+
+    if !intersect.is_intersecting {
+        return procedural_sky(*ray_direction);
+        // return SKYBOX_COLOR;
+    }
+
+    let light_dir = (light.position - intersect.point).normalized();
+    let view_dir = (*ray_origin - intersect.point).normalized();
+    let reflect_dir = reflect(&-light_dir, &intersect.normal).normalized();
+
+    let shadow_intensity = cast_shadow(&intersect, light, objects);
+    let light_intensity = light.intensity * (1.0 - shadow_intensity);
+
+    let diffuse_intensity = intersect.normal.dot(light_dir).max(0.0) * light_intensity;
+    let diffuse = intersect.material.diffuse * diffuse_intensity;
+
+    let specular_intensity = view_dir.dot(reflect_dir).max(0.0).powf(intersect.material.specular) * light_intensity;
+    let light_color_v3 = Vector3::new(light.color.r as f32 / 255.0, light.color.g as f32 / 255.0, light.color.b as f32 / 255.0);
+    let specular = light_color_v3 * specular_intensity;
+
+    let albedo = intersect.material.albedo;
+    let phong_color = diffuse * albedo[0] + specular * albedo[1];
+
+    // Reflections
+    let reflectivity = intersect.material.albedo[2];
+    let reflect_color = if reflectivity > 0.0 {
+        let reflect_dir = reflect(ray_direction, &intersect.normal).normalized();
+        let reflect_origin = offset_origin(&intersect, &reflect_dir);
+        cast_ray(&reflect_origin, &reflect_dir, objects, light, depth + 1)
+    } else {
+        Vector3::zero()
+    };
+
+    // Refractions
+    let transparency = intersect.material.albedo[3];
+    let refract_color = if transparency > 0.0 {
+        // Calculate the refracted ray direction. This can fail (return None) in case of total internal reflection.
+        if let Some(refract_dir) = refract(ray_direction, &intersect.normal, intersect.material.refractive_index) {
+            // If refraction is possible, cast a new ray.
+            let refract_origin = offset_origin(&intersect, &refract_dir);
+            cast_ray(&refract_origin, &refract_dir, objects, light, depth + 1)
+        } else {
+            // Total internal reflection occurred. In this case, the light is perfectly reflected.
+            // We cast a reflection ray instead of a refraction ray.
+            let reflect_dir = reflect(ray_direction, &intersect.normal).normalized();
+            let reflect_origin = offset_origin(&intersect, &reflect_dir);
+            cast_ray(&reflect_origin, &reflect_dir, objects, light, depth + 1)
+        }
+    } else {
+        // If the material is not transparent, the refracted color is black.
+        Vector3::zero()
+    };
+
+    // Combine the Phong color with the reflected and refracted colors using the material's albedo values.
+    phong_color * (1.0 - reflectivity - transparency) + reflect_color * reflectivity + refract_color * transparency
+}
+
+pub fn render(framebuffer: &mut Framebuffer, objects: &[Sphere], camera: &Camera, light: &Light) {
+    let width = framebuffer.width as f32;
+    let height = framebuffer.height as f32;
+    let aspect_ratio = width / height;
+    let fov = PI / 3.0;
+    let perspective_scale = (fov * 0.5).tan();
+
+    for y in 0..framebuffer.height {
+        for x in 0..framebuffer.width {
+            let screen_x = (2.0 * x as f32) / width - 1.0;
+            let screen_y = -(2.0 * y as f32) / height + 1.0;
+
+            let screen_x = screen_x * aspect_ratio * perspective_scale;
+            let screen_y = screen_y * perspective_scale;
+
+            let ray_direction = Vector3::new(screen_x, screen_y, -1.0).normalized();
+            
+            let rotated_direction = camera.basis_change(&ray_direction);
+
+            let pixel_color_v3 = cast_ray(&camera.eye, &rotated_direction, objects, light, 0);
+            let pixel_color = vector3_to_color(pixel_color_v3);
+
+            framebuffer.set_current_color(pixel_color);
+            framebuffer.set_pixel(x, y);
+        }
+    }
 }
 
 fn main() {
-  let window_width = 1300;
-  let window_height = 900;
-  let block_size = 100;
+    let window_width = 1300;
+    let window_height = 900;
+ 
+    let (mut window, thread) = raylib::init()
+        .size(window_width, window_height)
+        .title("Raytracer Example")
+        .log_level(TraceLogLevel::LOG_WARNING)
+        .build();
 
-  let (mut window, raylib_thread) = raylib::init()
-    .size(window_width, window_height)
-    .title("Raycaster Example")
-    .log_level(TraceLogLevel::LOG_WARNING)
-    .build();
+    let mut framebuffer = Framebuffer::new(window_width as u32, window_height as u32);
 
-  let mut framebuffer = Framebuffer::new(window_width as u32, window_height as u32);
-  framebuffer.set_background_color(Color::new(50, 50, 100, 255));
+    let rubber = Material::new(
+        Vector3::new(0.3, 0.1, 0.1),
+        10.0,
+        [0.9, 0.1, 0.0, 0.0],
+        0.0,
+    );
 
-  let maze = load_maze("maze.txt");
+    let ivory = Material::new(
+        Vector3::new(0.4, 0.4, 0.3),
+        50.0,
+        [0.6, 0.3, 0.1, 0.0],
+        0.0,
+    );
 
-  let mut player = Player {
-    pos: Vector2::new(150.0, 150.0),
-    a: PI / 3.0,
-    fov: PI / 3.0,
-  };
+    let glass = Material::new(
+        Vector3::new(0.6, 0.7, 0.8),
+        125.0,
+        [0.0, 0.5, 0.1, 0.8],
+        1.5,
+    );
 
-  while !window.window_should_close() {
-    // 1. clear framebuffer
-    framebuffer.clear();
+    let objects = [
+        Sphere { center: Vector3::new(0.0, 0.0, 0.0), radius: 1.0, material: rubber },
+        Sphere { center: Vector3::new(-1.0, -1.0, 1.5), radius: 0.5, material: ivory },
+        Sphere { center: Vector3::new(-0.3, 0.3, 1.5), radius: 0.3, material: glass },
+    ];
 
-    // 2. move the player on user input
-    process_events(&mut player, &window);
+    let mut camera = Camera::new(
+        Vector3::new(0.0, 0.0, 5.0),
+        Vector3::new(0.0, 0.0, 0.0),
+        Vector3::new(0.0, 1.0, 0.0),
+    );
+    let rotation_speed = PI / 100.0;
 
-    let mut mode = "3D";
+    let light = Light::new(
+        Vector3::new(1.0, -1.0, 5.0),
+        Color::new(255, 255, 255, 255),
+        1.5,
+    );
 
-    if window.is_key_down(KeyboardKey::KEY_M) {
-      mode = if mode == "2D" { "3D" } else { "2D" };
+    while !window.window_should_close() {
+        if window.is_key_down(KeyboardKey::KEY_LEFT) {
+            camera.orbit(rotation_speed, 0.0);
+        }
+        if window.is_key_down(KeyboardKey::KEY_RIGHT) {
+            camera.orbit(-rotation_speed, 0.0);
+        }
+        if window.is_key_down(KeyboardKey::KEY_UP) {
+            camera.orbit(0.0, -rotation_speed);
+        }
+        if window.is_key_down(KeyboardKey::KEY_DOWN) {
+            camera.orbit(0.0, rotation_speed);
+        }
+
+        framebuffer.clear();
+        render(&mut framebuffer, &objects, &camera, &light);
+        framebuffer.swap_buffers(&mut window, &thread);
     }
-
-    // 3. draw stuff
-    if mode == "2D" {
-      render_maze(&mut framebuffer, &maze, block_size, &player);
-    } else {
-      render_world(&mut framebuffer, &maze, block_size, &player);
-    }
-
-    // 4. swap buffers
-    framebuffer.swap_buffers(&mut window, &raylib_thread);
-
-    thread::sleep(Duration::from_millis(16));
-  }
 }
-
-
-
