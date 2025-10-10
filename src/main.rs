@@ -94,7 +94,7 @@ fn render(framebuffer: &mut Framebuffer, uniforms: &Uniforms, vertex_array: &[Ve
         if x < framebuffer.width && y < framebuffer.height {
             let color = fragment.color.to_hex();
             framebuffer.set_current_color(color);
-            framebuffer.point(x, y);
+            framebuffer.point(x, y, fragment.depth);
         }
     }
 }
