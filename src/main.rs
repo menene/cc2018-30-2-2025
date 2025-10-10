@@ -1,297 +1,190 @@
-use raylib::prelude::*;
+use nalgebra_glm::{Vec3, Mat4};
+use minifb::{Key, Window, WindowOptions};
+use std::time::Duration;
 use std::f32::consts::PI;
 
 mod framebuffer;
-mod ray_intersect;
-mod sphere;
-mod camera;
-mod light;
-mod material;
+mod triangle;
+mod line;
+mod vertex;
+mod obj;
+mod color;
+mod fragment;
+mod shaders;
 
 use framebuffer::Framebuffer;
-use ray_intersect::{Intersect, RayIntersect};
-use sphere::Sphere;
-use camera::Camera;
-use light::Light;
-use material::{Material, vector3_to_color};
+use vertex::Vertex;
+use obj::Obj;
+use triangle::triangle;
+use shaders::vertex_shader;
 
-const ORIGIN_BIAS: f32 = 1e-4;
 
-fn procedural_sky(dir: Vector3) -> Vector3 {
-    let d = dir.normalized();
-    let t = (d.y + 1.0) * 0.5; // map y [-1,1] → [0,1]
-
-    let green = Vector3::new(0.1, 0.6, 0.2); // grass green
-    let white = Vector3::new(1.0, 1.0, 1.0); // horizon haze
-    let blue = Vector3::new(0.3, 0.5, 1.0);  // sky blue
-
-    if t < 0.54 {
-        // Bottom → fade green to white
-        let k = t / 0.55;
-        green * (1.0 - k) + white * k
-    } else if t < 0.55 {
-        // Around horizon → mostly white
-        white
-    } else if t < 0.8 {
-        // Fade white to blue
-        let k = (t - 0.55) / (0.25);
-        white * (1.0 - k) + blue * k
-    } else {
-        // Upper sky → solid blue
-        blue
-    }
+pub struct Uniforms {
+    model_matrix: Mat4,
 }
 
-fn offset_origin(intersect: &Intersect, direction: &Vector3) -> Vector3 {
-    let offset = intersect.normal * ORIGIN_BIAS;
-    if direction.dot(intersect.normal) < 0.0 {
-        intersect.point - offset
-    } else {
-        intersect.point + offset
-    }
+fn create_model_matrix(translation: Vec3, scale: f32, rotation: Vec3) -> Mat4 {
+    let (sin_x, cos_x) = rotation.x.sin_cos();
+    let (sin_y, cos_y) = rotation.y.sin_cos();
+    let (sin_z, cos_z) = rotation.z.sin_cos();
+
+    let rotation_matrix_x = Mat4::new(
+        1.0,  0.0,    0.0,   0.0,
+        0.0,  cos_x, -sin_x, 0.0,
+        0.0,  sin_x,  cos_x, 0.0,
+        0.0,  0.0,    0.0,   1.0,
+    );
+
+    let rotation_matrix_y = Mat4::new(
+        cos_y,  0.0,  sin_y, 0.0,
+        0.0,    1.0,  0.0,   0.0,
+        -sin_y, 0.0,  cos_y, 0.0,
+        0.0,    0.0,  0.0,   1.0,
+    );
+
+    let rotation_matrix_z = Mat4::new(
+        cos_z, -sin_z, 0.0, 0.0,
+        sin_z,  cos_z, 0.0, 0.0,
+        0.0,    0.0,  1.0, 0.0,
+        0.0,    0.0,  0.0, 1.0,
+    );
+
+    let rotation_matrix = rotation_matrix_z * rotation_matrix_y * rotation_matrix_x;
+
+    let transform_matrix = Mat4::new(
+        scale, 0.0,   0.0,   translation.x,
+        0.0,   scale, 0.0,   translation.y,
+        0.0,   0.0,   scale, translation.z,
+        0.0,   0.0,   0.0,   1.0,
+    );
+
+    transform_matrix * rotation_matrix
 }
 
-fn reflect(incident: &Vector3, normal: &Vector3) -> Vector3 {
-    *incident - *normal * 2.0 * incident.dot(*normal)
-}
-
-fn refract(incident: &Vector3, normal: &Vector3, refractive_index: f32) -> Option<Vector3> {
-    // Implementation of Snell's Law for refraction.
-    // It calculates the direction of a ray as it passes from one medium to another.
-
-    // `cosi` is the cosine of the angle between the incident ray and the normal.
-    // We clamp it to the [-1, 1] range to avoid floating point errors.
-    let mut cosi = incident.dot(*normal).max(-1.0).min(1.0);
-
-    // `etai` is the refractive index of the medium the ray is currently in.
-    // `etat` is the refractive index of the medium the ray is entering.
-    // `n` is the normal vector, which may be flipped depending on the ray's direction.
-    let mut etai = 1.0; // Assume we are in Air (or vacuum) initially
-    let mut etat = refractive_index;
-    let mut n = *normal;
-
-    if cosi > 0.0 {
-        // The ray is inside the medium (e.g., glass) and going out into the air.
-        // We need to swap the refractive indices.
-        std::mem::swap(&mut etai, &mut etat);
-        // We also flip the normal so it points away from the medium.
-        n = -n;
-    } else {
-        // The ray is outside the medium and going in.
-        // We need a positive cosine for the calculation, so we negate it.
-        cosi = -cosi;
+fn render(framebuffer: &mut Framebuffer, uniforms: &Uniforms, vertex_array: &[Vertex]) {
+    // Vertex Shader Stage
+    let mut transformed_vertices = Vec::with_capacity(vertex_array.len());
+    for vertex in vertex_array {
+        let transformed = vertex_shader(vertex, uniforms);
+        transformed_vertices.push(transformed);
     }
 
-    // `eta` is the ratio of the refractive indices (n1 / n2).
-    let eta = etai / etat;
-    // `k` is a term derived from Snell's law that helps determine if total internal reflection occurs.
-    let k = 1.0 - eta * eta * (1.0 - cosi * cosi);
-
-    if k < 0.0 {
-        // If k is negative, it means total internal reflection has occurred.
-        // There is no refracted ray, so we return None.
-        None
-    } else {
-        // If k is non-negative, we can calculate the direction of the refracted ray.
-        Some(*incident * eta + n * (eta * cosi - k.sqrt()))
-    }
-}
-
-fn cast_shadow(
-    intersect: &Intersect,
-    light: &Light,
-    objects: &[Sphere],
-) -> f32 {
-    let light_dir = (light.position - intersect.point).normalized();
-    let light_distance = (light.position - intersect.point).length();
-
-    let shadow_ray_origin = offset_origin(intersect, &light_dir);
-
-    for object in objects {
-        let shadow_intersect = object.ray_intersect(&shadow_ray_origin, &light_dir);
-        if shadow_intersect.is_intersecting && shadow_intersect.distance < light_distance {
-            return 1.0; // Hit something, full shadow
+    // Primitive Assembly Stage
+    let mut triangles = Vec::new();
+    for i in (0..transformed_vertices.len()).step_by(3) {
+        if i + 2 < transformed_vertices.len() {
+            triangles.push([
+                transformed_vertices[i].clone(),
+                transformed_vertices[i + 1].clone(),
+                transformed_vertices[i + 2].clone(),
+            ]);
         }
     }
 
-    0.0 // No shadow
-}
-
-pub fn cast_ray(
-    ray_origin: &Vector3,
-    ray_direction: &Vector3,
-    objects: &[Sphere],
-    light: &Light,
-    depth: u32,
-) -> Vector3 {
-    if depth > 3 {
-        return procedural_sky(*ray_direction);
-        // return SKYBOX_COLOR;
+    // Rasterization Stage
+    let mut fragments = Vec::new();
+    for tri in &triangles {
+        fragments.extend(triangle(&tri[0], &tri[1], &tri[2]));
     }
 
-    let mut intersect = Intersect::empty();
-    let mut zbuffer = f32::INFINITY;
-
-    for object in objects {
-        let i = object.ray_intersect(ray_origin, ray_direction);
-        if i.is_intersecting && i.distance < zbuffer {
-            zbuffer = i.distance;
-            intersect = i;
-        }
-    }
-
-    if !intersect.is_intersecting {
-        return procedural_sky(*ray_direction);
-        // return SKYBOX_COLOR;
-    }
-
-    let light_dir = (light.position - intersect.point).normalized();
-    let view_dir = (*ray_origin - intersect.point).normalized();
-    let reflect_dir = reflect(&-light_dir, &intersect.normal).normalized();
-
-    let shadow_intensity = cast_shadow(&intersect, light, objects);
-    let light_intensity = light.intensity * (1.0 - shadow_intensity);
-
-    let diffuse_intensity = intersect.normal.dot(light_dir).max(0.0) * light_intensity;
-    let diffuse = intersect.material.diffuse * diffuse_intensity;
-
-    let specular_intensity = view_dir.dot(reflect_dir).max(0.0).powf(intersect.material.specular) * light_intensity;
-    let light_color_v3 = Vector3::new(light.color.r as f32 / 255.0, light.color.g as f32 / 255.0, light.color.b as f32 / 255.0);
-    let specular = light_color_v3 * specular_intensity;
-
-    let albedo = intersect.material.albedo;
-    let phong_color = diffuse * albedo[0] + specular * albedo[1];
-
-    // Reflections
-    let reflectivity = intersect.material.albedo[2];
-    let reflect_color = if reflectivity > 0.0 {
-        let reflect_dir = reflect(ray_direction, &intersect.normal).normalized();
-        let reflect_origin = offset_origin(&intersect, &reflect_dir);
-        cast_ray(&reflect_origin, &reflect_dir, objects, light, depth + 1)
-    } else {
-        Vector3::zero()
-    };
-
-    // Refractions
-    let transparency = intersect.material.albedo[3];
-    let refract_color = if transparency > 0.0 {
-        // Calculate the refracted ray direction. This can fail (return None) in case of total internal reflection.
-        if let Some(refract_dir) = refract(ray_direction, &intersect.normal, intersect.material.refractive_index) {
-            // If refraction is possible, cast a new ray.
-            let refract_origin = offset_origin(&intersect, &refract_dir);
-            cast_ray(&refract_origin, &refract_dir, objects, light, depth + 1)
-        } else {
-            // Total internal reflection occurred. In this case, the light is perfectly reflected.
-            // We cast a reflection ray instead of a refraction ray.
-            let reflect_dir = reflect(ray_direction, &intersect.normal).normalized();
-            let reflect_origin = offset_origin(&intersect, &reflect_dir);
-            cast_ray(&reflect_origin, &reflect_dir, objects, light, depth + 1)
-        }
-    } else {
-        // If the material is not transparent, the refracted color is black.
-        Vector3::zero()
-    };
-
-    // Combine the Phong color with the reflected and refracted colors using the material's albedo values.
-    phong_color * (1.0 - reflectivity - transparency) + reflect_color * reflectivity + refract_color * transparency
-}
-
-pub fn render(framebuffer: &mut Framebuffer, objects: &[Sphere], camera: &Camera, light: &Light) {
-    let width = framebuffer.width as f32;
-    let height = framebuffer.height as f32;
-    let aspect_ratio = width / height;
-    let fov = PI / 3.0;
-    let perspective_scale = (fov * 0.5).tan();
-
-    for y in 0..framebuffer.height {
-        for x in 0..framebuffer.width {
-            let screen_x = (2.0 * x as f32) / width - 1.0;
-            let screen_y = -(2.0 * y as f32) / height + 1.0;
-
-            let screen_x = screen_x * aspect_ratio * perspective_scale;
-            let screen_y = screen_y * perspective_scale;
-
-            let ray_direction = Vector3::new(screen_x, screen_y, -1.0).normalized();
-            
-            let rotated_direction = camera.basis_change(&ray_direction);
-
-            let pixel_color_v3 = cast_ray(&camera.eye, &rotated_direction, objects, light, 0);
-            let pixel_color = vector3_to_color(pixel_color_v3);
-
-            framebuffer.set_current_color(pixel_color);
-            framebuffer.set_pixel(x, y);
+    // Fragment Processing Stage
+    for fragment in fragments {
+        let x = fragment.position.x as usize;
+        let y = fragment.position.y as usize;
+        if x < framebuffer.width && y < framebuffer.height {
+            let color = fragment.color.to_hex();
+            framebuffer.set_current_color(color);
+            framebuffer.point(x, y);
         }
     }
 }
 
 fn main() {
-    let window_width = 1300;
-    let window_height = 900;
- 
-    let (mut window, thread) = raylib::init()
-        .size(window_width, window_height)
-        .title("Raytracer Example")
-        .log_level(TraceLogLevel::LOG_WARNING)
-        .build();
+    let window_width = 800;
+    let window_height = 600;
+    let framebuffer_width = 800;
+    let framebuffer_height = 600;
+    let frame_delay = Duration::from_millis(16);
 
-    let mut framebuffer = Framebuffer::new(window_width as u32, window_height as u32);
+    let mut framebuffer = Framebuffer::new(framebuffer_width, framebuffer_height);
+    let mut window = Window::new(
+        "Rust Graphics - Renderer Example",
+        window_width,
+        window_height,
+        WindowOptions::default(),
+    )
+    .unwrap();
 
-    let rubber = Material::new(
-        Vector3::new(0.3, 0.1, 0.1),
-        10.0,
-        [0.9, 0.1, 0.0, 0.0],
-        0.0,
-    );
+    window.set_position(500, 500);
+    window.update();
 
-    let ivory = Material::new(
-        Vector3::new(0.4, 0.4, 0.3),
-        50.0,
-        [0.6, 0.3, 0.1, 0.0],
-        0.0,
-    );
+    framebuffer.set_background_color(0x333355);
 
-    let glass = Material::new(
-        Vector3::new(0.6, 0.7, 0.8),
-        125.0,
-        [0.0, 0.5, 0.1, 0.8],
-        1.5,
-    );
+    let mut translation = Vec3::new(300.0, 200.0, 0.0);
+    let mut rotation = Vec3::new(0.0, 0.0, 0.0);
+    let mut scale = 100.0f32;
 
-    let objects = [
-        Sphere { center: Vector3::new(0.0, 0.0, 0.0), radius: 1.0, material: rubber },
-        Sphere { center: Vector3::new(-1.0, -1.0, 1.5), radius: 0.5, material: ivory },
-        Sphere { center: Vector3::new(-0.3, 0.3, 1.5), radius: 0.3, material: glass },
-    ];
+    let obj = Obj::load("assets/models/model.obj").expect("Failed to load obj");
+    let vertex_arrays = obj.get_vertex_array(); 
 
-    let mut camera = Camera::new(
-        Vector3::new(0.0, 0.0, 5.0),
-        Vector3::new(0.0, 0.0, 0.0),
-        Vector3::new(0.0, 1.0, 0.0),
-    );
-    let rotation_speed = PI / 100.0;
-
-    let light = Light::new(
-        Vector3::new(1.0, -1.0, 5.0),
-        Color::new(255, 255, 255, 255),
-        1.5,
-    );
-
-    while !window.window_should_close() {
-        if window.is_key_down(KeyboardKey::KEY_LEFT) {
-            camera.orbit(rotation_speed, 0.0);
+    while window.is_open() {
+        if window.is_key_down(Key::Escape) {
+            break;
         }
-        if window.is_key_down(KeyboardKey::KEY_RIGHT) {
-            camera.orbit(-rotation_speed, 0.0);
-        }
-        if window.is_key_down(KeyboardKey::KEY_UP) {
-            camera.orbit(0.0, -rotation_speed);
-        }
-        if window.is_key_down(KeyboardKey::KEY_DOWN) {
-            camera.orbit(0.0, rotation_speed);
-        }
+
+        handle_input(&window, &mut translation, &mut rotation, &mut scale);
 
         framebuffer.clear();
-        render(&mut framebuffer, &objects, &camera, &light);
-        framebuffer.swap_buffers(&mut window, &thread);
+
+        let model_matrix = create_model_matrix(translation, scale, rotation);
+        let uniforms = Uniforms { model_matrix };
+
+        framebuffer.set_current_color(0xFFDDDD);
+        render(&mut framebuffer, &uniforms, &vertex_arrays);
+
+        window
+            .update_with_buffer(&framebuffer.buffer, framebuffer_width, framebuffer_height)
+            .unwrap();
+
+        std::thread::sleep(frame_delay);
+    }
+}
+
+fn handle_input(window: &Window, translation: &mut Vec3, rotation: &mut Vec3, scale: &mut f32) {
+    if window.is_key_down(Key::Right) {
+        translation.x += 10.0;
+    }
+    if window.is_key_down(Key::Left) {
+        translation.x -= 10.0;
+    }
+    if window.is_key_down(Key::Up) {
+        translation.y -= 10.0;
+    }
+    if window.is_key_down(Key::Down) {
+        translation.y += 10.0;
+    }
+    if window.is_key_down(Key::S) {
+        *scale += 2.0;
+    }
+    if window.is_key_down(Key::A) {
+        *scale -= 2.0;
+    }
+    if window.is_key_down(Key::Q) {
+        rotation.x -= PI / 10.0;
+    }
+    if window.is_key_down(Key::W) {
+        rotation.x += PI / 10.0;
+    }
+    if window.is_key_down(Key::E) {
+        rotation.y -= PI / 10.0;
+    }
+    if window.is_key_down(Key::R) {
+        rotation.y += PI / 10.0;
+    }
+    if window.is_key_down(Key::T) {
+        rotation.z -= PI / 10.0;
+    }
+    if window.is_key_down(Key::Y) {
+        rotation.z += PI / 10.0;
     }
 }
